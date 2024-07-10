@@ -79,4 +79,4 @@ The author is not responsible for any misuse or damages caused by this script. U
 
 ---
 
-Feel free to customize this README according to your specific requirements or additional features you might add to the script.
+**Donations welcome to: 3KgiK7FdnEHpBDt3uie9mU1QRnVN8sP81o
