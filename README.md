@@ -1,4 +1,4 @@
-# Bitcoin Address Hunter
+# Bitcoin Sleep & Sweep
 
 This Python script generates Bitcoin addresses using mnemonic phrases, checks their balances, and automatically creates and broadcasts transactions if the balance exceeds a certain threshold.
 
